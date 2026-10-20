@@ -1,0 +1,95 @@
+name: Upstream-Sync claude-seo
+
+# Spiegelt AgriciDaniel/claude-seo täglich und erzeugt bei Änderungen einen PR.
+# Patch für den claude.ai-Plugin-Sync: verschachteltes Plugin plugins/seo-cockpit entfernen.
+# Kein PAT nötig: Die Sync-Commits ändern nie Dateien unter .github/workflows.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Upstream holen
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/AgriciDaniel/claude-seo.git "$RUNNER_TEMP/upstream"
+          echo "UPSTREAM_SHA=$(git -C "$RUNNER_TEMP/upstream" rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Prüfen, ob Upstream neu ist
+        id: check
+        run: |
+          CURRENT=$(cat .upstream-sha 2>/dev/null || echo none)
+          if [ "$CURRENT" = "$UPSTREAM_SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream unverändert ($UPSTREAM_SHA)."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Neu: $CURRENT -> $UPSTREAM_SHA"
+          fi
+
+      - name: Upstream übernehmen und für claude.ai patchen
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          cp .github/workflows/sync.yml "$RUNNER_TEMP/sync.yml"
+          cp README.claudeai.md "$RUNNER_TEMP/README.claudeai.md"
+
+          # Arbeitsbaum (ohne .git) leeren und mit Upstream füllen
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          tar -C "$RUNNER_TEMP/upstream" --exclude=.git -cf - . | tar -xf -
+
+          # Upstream-CI entfernen, eigene Dateien wiederherstellen
+          rm -rf .github
+          mkdir -p .github/workflows
+          cp "$RUNNER_TEMP/sync.yml" .github/workflows/sync.yml
+          cp "$RUNNER_TEMP/README.claudeai.md" README.claudeai.md
+
+          # Verschachteltes Plugin entfernen (claude.ai-Sync lehnt es ab)
+          rm -rf plugins/seo-cockpit
+          rmdir plugins 2>/dev/null || true
+          jq '.plugins |= map(select(.name != "seo-cockpit"))' .claude-plugin/marketplace.json > "$RUNNER_TEMP/m.json"
+          mv "$RUNNER_TEMP/m.json" .claude-plugin/marketplace.json
+
+          # Guards: alles, was claude.ai ablehnt, muss weg sein
+          test -f .claude-plugin/plugin.json || { echo "::error::Root-plugin.json fehlt upstream."; exit 1; }
+          NESTED=$(find . -path ./.git -prune -o -path '*/.claude-plugin/plugin.json' -print | grep -v '^\./\.claude-plugin/plugin\.json$' || true)
+          if [ -n "$NESTED" ]; then echo "::error::Weitere verschachtelte Plugins: $NESTED"; exit 1; fi
+          if [ -d bin ]; then echo "::error::Top-level bin/ vorhanden – wird von claude.ai abgelehnt."; exit 1; fi
+          if ! git diff --quiet -- .github/workflows; then echo "::error::Sync würde Workflow-Dateien ändern."; exit 1; fi
+
+          echo "$UPSTREAM_SHA" > .upstream-sha
+
+      - name: Pull Request erstellen
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BRANCH="sync/${UPSTREAM_SHA}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add -A
+          git commit -m "Sync AgriciDaniel/claude-seo@${UPSTREAM_SHA} (seo-cockpit entfernt)"
+          git push -f origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "Upstream-Sync ${UPSTREAM_SHA}" \
+            --body "Automatischer Sync von https://github.com/AgriciDaniel/claude-seo/commit/${UPSTREAM_SHA}. Vor dem Merge Diff in scripts/, hooks/, agents/ und skills/ prüfen. Nach dem Merge synchronisiert claude.ai das Plugin." \
+            || echo "PR existiert bereits."
