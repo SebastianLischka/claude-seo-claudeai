@@ -24,6 +24,11 @@ from pathlib import Path
 from typing import Any
 
 RUNTIME_SCHEMA = 1
+# Supported interpreter range. scripts/claude-seo and install.ps1 repeat these
+# bounds, and tests/test_python_range.py keeps every copy in step. 3.15 waits
+# on google-ads, whose wheels declare Python < 3.15.
+MIN_PYTHON = (3, 11)
+MAX_PYTHON = (3, 14)
 LOCK_STALE_SECONDS = 30 * 60
 SCRIPT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*\.py$")
 EXTENSION_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -41,11 +46,12 @@ ALLOWED_CORE_SCRIPTS = frozenset(
         "indexnow_submit.py", "iptc_ai_label.py", "keyword_planner.py",
         "keywordseverywhere_api.py",
         "lcp_subparts.py", "lighthouse_agentic.py", "matomo_auth.py", "matomo_report.py", "metadata_template.py",
-        "moz_api.py", "nlp_analyze.py", "pagespeed_check.py",
+        "moz_api.py", "nlp_analyze.py", "page_checks.py", "pagespeed_check.py",
         "parasite_risk.py", "parse_html.py", "preload_check.py", "render_page.py",
         "portability_check.py", "consistency_check.py",
         "schema_ecommerce_validate.py", "schema_generate.py", "seo_updates.py",
-        "sitemap_discovery.py", "sync_flow.py", "ucp_check.py", "unlighthouse_run.py",
+        "sitemap_discovery.py", "sync_flow.py", "transport_check.py", "ucp_check.py",
+        "unlighthouse_run.py",
         "url_safety.py", "validate_backlink_report.py", "verify_backlinks.py",
         "youtube_search.py",
     }
@@ -157,6 +163,19 @@ def _expected(root: Path) -> dict[str, Any]:
     }
 
 
+def _python_supported() -> bool:
+    return MIN_PYTHON <= sys.version_info[:2] <= MAX_PYTHON
+
+
+def _python_range_message() -> str:
+    found = f"{sys.version_info.major}.{sys.version_info.minor}"
+    return (
+        f"Claude SEO needs Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} to "
+        f"{MAX_PYTHON[0]}.{MAX_PYTHON[1]}. Found {found} ({sys.executable}). "
+        "Install a supported Python or set CLAUDE_SEO_PYTHON."
+    )
+
+
 def _status(root: Path) -> dict[str, Any]:
     data_dir, mode = _data_dir(root)
     venv = data_dir / ".venv"
@@ -164,6 +183,8 @@ def _status(root: Path) -> dict[str, Any]:
     state = _load_state(data_dir)
     expected = _expected(root)
     reasons: list[str] = []
+    if not _python_supported():
+        reasons.append(f"python {expected['python']} is outside the supported range")
     if not python.is_file():
         reasons.append("managed environment is missing")
     for key in ("runtime_schema", "requirements_sha256", "python"):
@@ -270,7 +291,27 @@ class SetupLock:
         self.path.unlink(missing_ok=True)
 
 
+def _replace_with_retry(source: Path, target: Path, attempts: int = 8) -> None:
+    """Swap a directory into place, tolerating Windows handle-release lag.
+
+    Right after pip or Playwright writes a venv, Windows (often Defender) can
+    hold handles in it briefly, so the rename fails with WinError 5 and then
+    succeeds about a second later.
+    """
+    for attempt in range(attempts):
+        try:
+            source.replace(target)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.25 * (attempt + 1))
+
+
 def command_setup(args: argparse.Namespace) -> int:
+    if not _python_supported():
+        print(_python_range_message(), file=sys.stderr)
+        return 2
     root = _root()
     status = _status(root)
     data_dir: Path = status["data_dir"]
@@ -328,9 +369,9 @@ def command_setup(args: argparse.Namespace) -> int:
             )
             shutil.rmtree(backup, ignore_errors=True)
             if final_venv.exists():
-                final_venv.replace(backup)
+                _replace_with_retry(final_venv, backup)
                 previous_moved = True
-            staged.replace(final_venv)
+            _replace_with_retry(staged, final_venv)
             swapped = True
             state = dict(status["expected"])
             state["browser_ready"] = browser_ready
@@ -345,7 +386,7 @@ def command_setup(args: argparse.Namespace) -> int:
             if swapped:
                 shutil.rmtree(final_venv, ignore_errors=True)
             if previous_moved and had_previous and backup.exists():
-                backup.replace(final_venv)
+                _replace_with_retry(backup, final_venv)
         print(f"Claude SEO setup failed: {_redact(str(exc))}", file=sys.stderr)
         return 1
     if browser_ready or args.skip_browser:
