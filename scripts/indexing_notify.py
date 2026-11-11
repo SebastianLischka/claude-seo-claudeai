@@ -115,9 +115,12 @@ def notify_url(
                 "Also ensure the Indexing API is enabled in your GCP project."
             )
         elif "429" in error_str:
+            result["error_code"] = "quota_exceeded"
             result["error"] = (
                 f"Quota exceeded. Daily limit: {DAILY_QUOTA} publish requests. "
-                "Apply for a quota increase at https://developers.google.com/search/apis/indexing-api/v3/quota-increase"
+                "Check your quota in the Google API Console "
+                "(https://console.cloud.google.com/apis/api/indexing.googleapis.com/quotas); "
+                "see https://developers.google.com/search/apis/indexing-api/v3/quota-pricing"
             )
         elif "400" in error_str:
             result["error"] = f"Invalid URL or request: {e}"
@@ -210,8 +213,7 @@ def batch_notify(
             f"Only the first {DAILY_QUOTA} URLs will be submitted."
         )
         urls = urls[:DAILY_QUOTA]
-
-    if len(urls) > 50:
+    elif len(urls) > 50:
         result["quota_warning"] = (
             f"Submitting {len(urls)} URLs will use {len(urls)}/{DAILY_QUOTA} "
             f"of your daily quota."
@@ -230,7 +232,9 @@ def batch_notify(
         if notification.get("error"):
             result["summary"]["error"] += 1
             # Stop on quota errors
-            if "429" in str(notification.get("error", "")):
+            if notification.get("error_code") == "quota_exceeded" or "429" in str(
+                notification.get("error", "")
+            ):
                 result["error"] = "Stopped: daily quota exceeded."
                 break
         else:
