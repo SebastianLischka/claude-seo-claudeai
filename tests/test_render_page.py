@@ -283,10 +283,14 @@ def test_render_page_never_mode_against_example_com() -> None:
 
 
 def _fake_response(text: str, status: int = 200, url: str = "https://x.example/"):
+    body = text.encode("utf-8")
     return SimpleNamespace(
-        text=text, content=text.encode("utf-8"), status_code=status,
+        text=text, content=body, status_code=status,
         headers={"Content-Type": "text/html"},
         url=url, history=[],
+        # render_page streams the raw body through url_safety.read_bounded.
+        iter_content=lambda chunk_size=1: iter([body]),
+        close=lambda: None,
     )
 
 
@@ -357,12 +361,23 @@ class _FakePlaywrightManager:
             def detach(self):
                 return None
 
+        # Recorded on the page so tests can assert how the context was guarded.
+        page.context_kwargs = None
+        page.context_routes = []
+        page.context_ws_routes = []
         context = SimpleNamespace(
             new_page=lambda: page,
             new_cdp_session=lambda _page: _Session(),
+            route=lambda url, handler: page.context_routes.append((url, handler)),
+            route_web_socket=lambda url, handler: page.context_ws_routes.append((url, handler)),
         )
+
+        def new_context(**kwargs):
+            page.context_kwargs = kwargs
+            return context
+
         browser = SimpleNamespace(
-            new_context=lambda **_kwargs: context,
+            new_context=new_context,
             close=lambda: None,
         )
         self.playwright = SimpleNamespace(
@@ -395,6 +410,19 @@ def test_render_uses_domcontentloaded_for_persistent_socket_pages() -> None:
     assert result["error"] is None
     assert page.goto_options["wait_until"] == "domcontentloaded"
     assert result["render_diagnostics"] == []
+
+
+def test_render_context_blocks_service_workers_and_websockets() -> None:
+    page = _FakeBrowserPage([(200, 20), (200, 20), (200, 20)])
+    result = _render_with_fake_browser(page)
+    assert result["error"] is None
+    assert page.context_kwargs["service_workers"] == "block"
+    assert page.context_kwargs["user_agent"]
+    assert [url for url, _handler in page.context_routes] == ["**/*"]
+    assert [url for url, _handler in page.context_ws_routes] == ["**/*"]
+    import url_safety
+
+    assert page.context_ws_routes[0][1] is url_safety._never_connect_web_socket
 
 
 def test_render_navigation_timeout_returns_degraded_dom() -> None:
@@ -547,9 +575,81 @@ def test_render_page_result_dict_has_all_documented_fields() -> None:
         "extracted_text", "publication_date", "accessibility_tree",
         "accessibility_error", "accessibility_partial",
         "headers", "redirect_chain", "console_errors", "render_engine",
-        "render_diagnostics", "render_ms", "mode_used", "error",
+        "render_diagnostics", "render_ms", "mode_used", "too_large", "js_gap",
+        "error",
     }
     assert set(result.keys()) == expected_fields
+    # No render happened, so there is nothing to compare.
+    assert result["js_gap"] is None
+
+
+def test_rendered_result_carries_the_js_gap() -> None:
+    """A rendered page compares the raw shell with the hydrated DOM."""
+    page = _FakeBrowserPage([(200, 20), (200, 20), (200, 20)])
+    result = _render_with_fake_browser(page)
+    gap = result["js_gap"]
+    assert result["mode_used"] == "rendered"
+    assert gap["raw"]["words"] == 0
+    assert gap["rendered"]["words"] == 40
+    assert gap["diff"]["words_only_rendered_share"] == 1.0
+    assert gap["raw_truncated"] is False
+    assert gap["significant"] is True
+    # The CLI JSON is built from the full strings, before --max-text cuts them.
+    summary = render_page._json_summary(result, max_text=10)
+    assert summary["js_gap"] == gap
+    json.dumps(summary)
+
+
+def test_js_gap_in_the_cli_json_is_bounded_without_max_text() -> None:
+    """--max-text does not cut js_gap, so js_gap has to be small on its own."""
+    big = "A" * 200_000
+    blocks = "".join(
+        f'<script type="application/ld+json">{{"@type": "{big}{i}"}}</script>' for i in range(5)
+    )
+    page = _FakeBrowserPage([(200, 20), (200, 20), (200, 20)])
+    page.content = lambda: (
+        f"<html><head><title>{big}</title>{blocks}</head>"
+        f"<body><h1>{big}</h1>" + ("hydrated content " * 20) + "</body></html>"
+    )
+    result = _render_with_fake_browser(page)
+    gap = result["js_gap"]
+    assert gap["diff"]["schema_types_only_rendered"]
+    for max_text in (0, 2000):
+        summary = render_page._json_summary(result, max_text=max_text)
+        assert summary["js_gap"] == gap
+        assert len(json.dumps(summary["js_gap"], indent=2)) < 5_000
+
+
+def test_js_gap_stays_null_when_the_render_fails() -> None:
+    spa_html = '<html><body><div id="root"></div></body></html>'
+    with patch.object(render_page, "validate_url_strict", side_effect=_mock_validate_strict), \
+         patch.object(render_page, "safe_requests_get",
+                      return_value=_fake_response(spa_html)), \
+         patch.object(render_page, "sync_playwright", None):
+        result = render_page.render_page("https://app.example/", mode="auto")
+    assert result["error"] is not None
+    assert result["js_gap"] is None
+
+
+def test_js_gap_is_skipped_for_oversized_html(monkeypatch) -> None:
+    monkeypatch.setattr(render_page, "JS_GAP_MAX_HTML_CHARS", 100)
+    page = _FakeBrowserPage([(200, 20), (200, 20), (200, 20)])
+    result = _render_with_fake_browser(page)
+    assert result["error"] is None
+    assert result["js_gap"] is None
+    assert result["render_diagnostics"] == [
+        "js_gap skipped: HTML is larger than 100 characters"
+    ]
+
+
+def test_js_gap_failure_is_a_diagnostic_not_an_error() -> None:
+    page = _FakeBrowserPage([(200, 20), (200, 20), (200, 20)])
+    with patch.object(render_page, "js_gap", side_effect=RuntimeError("boom")):
+        result = _render_with_fake_browser(page)
+    assert result["error"] is None
+    assert result["js_gap"] is None
+    assert result["content"].startswith("<html>")
+    assert any("js_gap comparison failed" in item for item in result["render_diagnostics"])
 
 
 def test_cdp_accessibility_nodes_are_bounded_and_rebuilt(monkeypatch) -> None:
