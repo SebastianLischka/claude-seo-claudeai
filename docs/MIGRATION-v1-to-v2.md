@@ -20,8 +20,7 @@ files, new extensions. Existing audit reports will look slightly fuller
 but use exactly the same overall structure.
 
 This guide covers the v1.x → v2.0.0 jump only; the v2.1.0 through v2.2.5
-releases are documented in [../CHANGELOG.md](../CHANGELOG.md), and the
-suite is now at 410 tests.
+releases are documented in [../CHANGELOG.md](../CHANGELOG.md).
 
 ## What's new in v2
 
@@ -136,9 +135,10 @@ silently allow private-IP fetches.
 ### 2. `seo-schema` flags retired rich-result types as Critical
 
 If your generated JSON-LD includes `@type: ClaimReview`, `Vehicle`,
-`EstimatedSalary`, `LearningVideo`, `SpecialAnnouncement`, or
-`CourseInfo` (carousel variant), the new
+`EstimatedSalary`, `LearningVideo` or `SpecialAnnouncement`, the new
 `scripts/schema_ecommerce_validate.py` will emit a `Critical` finding.
+Since v2.6.3 `Course` is not flagged: Google retired Course Info, which
+has no type of its own, and Course list is still live.
 
 **Action:** consult `skills/seo-schema/references/deprecated-types-2024-2026.md`
 for the recommended replacement per type. If you need to keep the
